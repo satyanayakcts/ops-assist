@@ -8,7 +8,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 # Setup Gemini for now.
 # TODO : give option to set the api key from UI 
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+    model="gemini-2.5-flash", 
+    #model="gemini-3-pro-preview", 
     api_key=st.secrets["passwords"]["GOOGLE_API_KEY"],
     temperature=0
 )
@@ -153,6 +154,7 @@ def summerize_insight_node(state: AgentState):
     Your Task:
     - Provide a direct answer.
     - If answer can be given in a table format, please do so.
+    - If answer has decimal numbers, round it off to a whole number.
     - If the result is '0' or 'No data', explain that the records might be empty or improperly formatted in the source file.
     - Do not simple say "I cannot provide the information" if there is a number available.
     """

@@ -12,4 +12,7 @@ wheels/
 # Source Files
 .streamlit/*
 data/*
-util/*
+util/media
+util/test_data
+
+help.md

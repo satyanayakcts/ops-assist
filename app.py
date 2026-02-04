@@ -39,8 +39,8 @@ def login_screen():
     return False
 
 
-# if not login_screen():
-#     st.stop()
+if not login_screen():
+    st.stop()
 
 # Initialize Database COnnection
 def get_db_con():
@@ -91,58 +91,98 @@ def data_ingestion_ui():
 def create_master_report_view():
     sql = """
     CREATE OR REPLACE VIEW dashboard AS
-    WITH 
-    -- 1. Aggregate Employees into Project-Grade buckets
-    util_summarized AS (
-        SELECT 
-            "Project Id", 
-            Practice, 
-            "Utilization Location" AS Location, 
-            "Grade Name" AS Grade,
-            ANY_VALUE("Project Name") AS project_name, -- Just grab the name once
-            COUNT("Associate ID") AS headcount,
-            SUM(TRY_CAST("Billed FTE Internal" AS DOUBLE)) AS total_billed_fte,
-            SUM(TRY_CAST("Total FTE" AS DOUBLE)) AS total_fte,
-            ANY_VALUE("BU") AS bu_id,
-            ANY_VALUE("Customer Id") AS account_id
-        FROM utilization_prediction_report
+        WITH 
+        -- 1. Aggregate Employees into Project-Grade buckets
+        util_summarized AS (
+            SELECT 
+                "Project Id", 
+                Practice, 
+                "Utilization Location" AS Location, 
+                "Grade Name" AS Grade,
+                COUNT("Associate ID") AS headcount,
+                SUM(TRY_CAST("Billed FTE Internal" AS DOUBLE)) AS billed_fte,
+                SUM(TRY_CAST("Total FTE" AS DOUBLE)) AS total_fte,
+                ANY_VALUE("BU") AS bu_id,
+                ANY_VALUE("Customer Id") AS account_id,
+                ANY_VALUE("Project Name") AS project_name,
+                ANY_VALUE("Project Billability") AS project_billability,
+                ANY_VALUE("Customer Name") AS customer_name,
+                ANY_VALUE("ParentCustomerID") AS parent_customer_id,
+                ANY_VALUE("Parent Customer") AS parent_customer,
+                ANY_VALUE("Is Onsite") AS is_onsite,
+                strftime(CURRENT_DATE, '%Y-%m-%d') AS prediction_date,
+                
+            FROM utilization_prediction_report
+            GROUP BY 1, 2, 3, 4
+        ),
+        -- 2. Your Demand Summary (already correct)
+        demand_summary AS (
+            SELECT "Project Id", Practice, Location, "Grade HR" AS Grade, COUNT(*) AS dem_count
+            FROM demand_base
+            GROUP BY 1, 2, 3, 4
+        ),
+        -- 3. Your Release Summary (already correct)
+        release_summary AS (
+            SELECT "Project Id", Practice, Location, Grade, COUNT(*) AS rel_count
+            FROM np_jan26
+            GROUP BY 1, 2, 3, 4
+        ),
+        -- New Cleaned Up Account Map
+        map_account_unique AS (
+        SELECT "Account ID", ANY_VALUE("PDL ID") AS "PDL ID", ANY_VALUE("PDL Name") AS "PDL Name"
+        FROM map_account
+        GROUP BY "Account ID"
+        ),
+        -- Previous month actual
+        previous_util AS (
+        SELECT "Project Id", Practice, "Utilization Location" AS Location, "Grade Name" AS Grade,
+        SUM(TRY_CAST("Billed FTE Internal" AS DOUBLE)) AS prev_mon_actual_billed_fte
+        FROM previous_month_actual
         GROUP BY 1, 2, 3, 4
-    ),
-    -- 2. Your Demand Summary (already correct)
-    demand_summary AS (
-        SELECT "Project Id", Practice, Location, "Grade HR" AS Grade, COUNT(*) AS dem_count
-        FROM demand_base
-        GROUP BY 1, 2, 3, 4
-    ),
-    -- 3. Your Release Summary (already correct)
-    release_summary AS (
-        SELECT "Project Id", Practice, Location, Grade, COUNT(*) AS rel_count
-        FROM np_jan26
-        GROUP BY 1, 2, 3, 4
-    )
+        )
 
-    -- 4. Final Join (1-to-1-to-1 Join)
-    SELECT 
-        u."Project Id", u.project_name, u.Practice, u.Location, u.bu_id, u.Grade, u.account_id, u.total_billed_fte,
-        COALESCE(r.rel_count, 0) AS release_count,
-        COALESCE(d.dem_count, 0) AS open_demands,
-        l_map.Country, l_map.Geo,
-        b_map.SBU, b_map.Market,
-        s_map."SBU Head ID", s_map."SBU Head Name"
-    FROM util_summarized u
-    LEFT JOIN release_summary r 
-        ON  u."Project Id" = r."Project Id" 
-        AND u.Practice = r.Practice 
-        AND u.Location = r.Location 
-        AND u.Grade = r.Grade
-    LEFT JOIN demand_summary d 
-        ON  u."Project Id" = d."Project Id" 
-        AND u.Practice = d.Practice 
-        AND u.Location = d.Location 
-        AND u.Grade = d.Grade
-    LEFT JOIN map_location l_map ON u.Location = l_map."Utilization Location"
-    LEFT JOIN map_bu b_map       ON u.bu_id = b_map.BU
-    LEFT JOIN map_sbu s_map      ON b_map.SBU = s_map.SBU;
+        -- 4. Final Join (1-to-1-to-1 Join)
+        SELECT  
+            u."Project Id", u.project_name, u.Practice, u.Location, u.Grade, g_map."CoD Grade", u.project_billability, 
+            u.customer_name, u.parent_customer_id, u.parent_customer, u.is_onsite, u.bu_id, 
+            u.account_id,u.billed_fte, u.prediction_date,
+            p.prev_mon_actual_billed_fte,
+            COALESCE(r.rel_count, 0) AS release_count,
+            COALESCE(d.dem_count, 0) AS open_demands, 
+            (u.billed_fte + open_demands - release_count ) AS eff_billed_fte, 
+            (CAST(c.Cost AS DOUBLE)) AS d_cost, 
+            (u.billed_fte * d_cost) AS curr_total_cost,
+            (eff_billed_fte * d_cost) AS pred_total_cost,
+            l_map.Country, l_map.Geo,
+            b_map.SBU, b_map.Market,
+            a_map."PDL ID",a_map."PDL Name",
+            s_map."SBU Head ID", s_map."SBU Head Name"
+            
+        FROM util_summarized u
+        LEFT JOIN release_summary r 
+            ON  u."Project Id" = r."Project Id" 
+            AND u.Practice = r.Practice 
+            AND u.Location = r.Location 
+            AND u.Grade = r.Grade
+        LEFT JOIN demand_summary d 
+            ON  u."Project Id" = d."Project Id" 
+            AND u.Practice = d.Practice 
+            AND u.Location = d.Location 
+            AND u.Grade = d.Grade
+        LEFT JOIN previous_util p
+        ON u."Project Id" = p."Project Id"
+        AND u.Practice = p.Practice 
+        AND u.Location = p.Location 
+        AND u.Grade = p.Grade
+        LEFT JOIN map_location l_map ON u.Location = l_map."Utilization Location"
+        LEFT JOIN cost_dec_25 c
+                ON u.Practice = c.Practice
+                AND l_map.Country = c.Country
+                AND u.Grade = c."Grade name"
+        LEFT JOIN map_bu b_map       ON u.bu_id = b_map.BU
+        LEFT JOIN map_sbu s_map      ON b_map.SBU = s_map.SBU
+        LEFT JOIN map_grade g_map    ON u.Grade = g_map.Grade
+        LEFT JOIN map_account_unique a_map  ON u.account_id = a_map."Account ID";
     """
 
     try:
@@ -186,8 +226,11 @@ def confirm_delete_dialog(table_name):
     if c1.button("Yes, Delete", type="primary", use_container_width=True):
         try:
             with get_db_con() as con:
-                con.execute(f'DROP VIEW IF EXISTS "{table_name}"')
-                con.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+                is_view = con.execute(f"SELECT 1 FROM duckdb_views WHERE view_name = '{table_name}'").fetchone()
+                if is_view:
+                    con.execute(f'DROP VIEW IF EXISTS "{table_name}"')
+                else:
+                    con.execute(f'DROP TABLE IF EXISTS "{table_name}"')
             del st.session_state.confirm_delete
             st.toast(f"Removed {table_name}")
             st.rerun()
@@ -394,7 +437,7 @@ if prompt := st.chat_input("Ask a question about the selected data ..."):
     else:
         # Show user message
         st.session_state.messages.append({"role":"user", "content": prompt})
-        with st.chat_message("user"):
+        with st.chat_message("user", avatar="🧑‍💻"):
             st.markdown(prompt)
         
     # Run the agent
