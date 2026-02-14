@@ -1,18 +1,30 @@
+import os
 import duckdb
 import pandas as pd
 import streamlit as st
 from typing import TypedDict, List
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.output_parsers import StrOutputParser
+
+api_key = os.getenv("GOOGLE_API_KEY")
+if not api_key:
+    api_key = st.secrets["passwords"]["GOOGLE_API_KEY"]
+
+db_path = os.getenv("DATABASE_PATH")
+if not db_path:
+    db_path = st.secrets["passwords"]["DB_PATH"]
 
 # Setup Gemini for now.
 # TODO : give option to set the api key from UI 
-llm = ChatGoogleGenerativeAI(
+llm_config = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash", 
     #model="gemini-3-pro-preview", 
-    api_key=st.secrets["passwords"]["GOOGLE_API_KEY"],
+    api_key=api_key,
     temperature=0
 )
+
+llm = llm_config | StrOutputParser()
 
 # Define the State. This will be the overall state of the agent at runtime
 class AgentState(TypedDict):
@@ -21,8 +33,6 @@ class AgentState(TypedDict):
     sql_query: str
     query_result: str
     messages: List[str]
-
-DB_PATH = st.secrets["passwords"]["DB_PATH"]
 
 # def get_schema():
 #     """Helper to get schema from DuckDB for the LLM"""
@@ -48,7 +58,7 @@ def get_schema(tables: List[str]):
     """Fetches the schema from the database tables"""
     if not tables:
         return "No tables selected."
-    con = duckdb.connect(DB_PATH, read_only=True)
+    con = duckdb.connect(db_path, read_only=True)
     schema_context = []
 
     for table in tables:
@@ -93,20 +103,20 @@ def generate_query_node(state: AgentState):
     1. All columns are stored as strings. Use TRY_CAST(column_name AS DOUBLE) for any mathematical operations (SUM, AVG, etc.).
     2. Use ILIKE for string comparisons to ensure case-insensitivity.
     3. Use the exact table names provided in the schema.
-    4. Return ONLY the SQL query. No explanation or backticks.
+    4. Output the SQL query as plain text only. Do not use markdown blocks or backticks.
 
     USER QUESTION: {state['question']}
     """
 
     response = llm.invoke(prompt)
-    sql = response.content.replace("```sql", "").replace("```", "").strip()
+    #sql = response.replace("```sql", "").replace("```", "").strip()
 
-    return {"sql_query": sql}
+    return {"sql_query": response}
 
 def execute_query_node(state: AgentState):
     """Node 2: Run SQL in DuckDB"""
 
-    with duckdb.connect(DB_PATH) as con:
+    with duckdb.connect(db_path) as con:
         try:
             df_result = con.execute(state['sql_query']).df()
 
@@ -160,7 +170,10 @@ def summerize_insight_node(state: AgentState):
     """
 
     response = llm.invoke(prompt)
-    return {"messages": [response.content]}
+    return {"messages": [response]}
+    # output = llm.invoke(prompt)
+    # response = output.content if hasattr(output, 'content') else output
+    # return {"messages": response}
 
 workflow = StateGraph(AgentState)
 

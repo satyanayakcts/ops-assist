@@ -16,3 +16,4 @@ util/media
 util/test_data
 
 help.md
+.env

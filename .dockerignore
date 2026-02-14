@@ -1,0 +1,22 @@
+# python & uv
+.venv/
+.uv/
+
+# Data
+*.db
+*.db.wal
+*.csv
+*.xlsx
+data/
+
+# Environment & secrets
+.env
+.streamlit/secrets.toml
+
+# Git and Docker
+.git 
+.gitignore 
+Dockerfile
+docker-compose.yaml
+.dockerignore
+

@@ -2,15 +2,20 @@ import streamlit as st
 import pandas as pd
 import duckdb
 import os
+import datetime
 from src.agent import app as agent_app
+
+pd.set_option("styler.render.max_elements", 1000000)
 
 st.set_page_config(
     page_title="Executive Data AI", 
     page_icon="📊",
     layout="wide"
     )
-# st.title("Executive Data Assistant")
-DB_PATH = st.secrets["passwords"]["DB_PATH"]
+
+db_path = os.getenv("DATABASE_PATH")
+if not db_path:
+    db_path = st.secrets["passwords"]["DB_PATH"]
 
 def login_screen():
     """Returns True if the user is authenticated, False otherwise."""
@@ -39,19 +44,20 @@ def login_screen():
     return False
 
 
-if not login_screen():
-    st.stop()
+# if not login_screen():
+#     st.stop()
 
 # Initialize Database COnnection
+#@st.cache_resource
 def get_db_con():
-    return duckdb.connect(DB_PATH)
+    return duckdb.connect(db_path, read_only=False)
 
 def get_db_con_ro():
-    return duckdb.connect(DB_PATH, read_only=True)
+    return duckdb.connect(db_path, read_only=True)
 
 def get_all_tables():
     """Queries DuckDB to find all user-created tables."""
-    with get_db_con() as con:
+    with get_db_con_ro() as con:
         tables = con.execute("""
             SELECT table_name FROM information_schema.tables
             WHERE table_schema = 'main'
@@ -80,6 +86,7 @@ def data_ingestion_ui():
             with st.status(f"Ingesting {table_name} ...", expanded=True) as status:
                 try:
                     df = pd.read_excel(uploaded_file, engine='calamine', dtype=str)
+                    df['load_date'] = pd.Timestamp.now(tz='Asia/Kolkata').strftime('%Y-%m-%d %H:%M:%S %Z')
                     with get_db_con() as con:
                         con.execute(f"CREATE OR REPLACE TABLE {table_name} AS SELECT * FROM df")
                     status.update(label=f"✅ {table_name} Loaded", state="complete")
@@ -88,43 +95,73 @@ def data_ingestion_ui():
                     st.error(f"Faled to load {table_name}: {e}")
         st.rerun()
 
-def create_master_report_view():
-    sql = """
+def create_master_report_view(f_weight, d_weight):
+    sql = f"""
     CREATE OR REPLACE VIEW dashboard AS
         WITH 
-        -- 1. Aggregate Employees into Project-Grade buckets
+        -- 1. Current Month Aggregation
         util_summarized AS (
             SELECT 
-                "Project Id", 
-                Practice, 
-                "Utilization Location" AS Location, 
-                "Grade Name" AS Grade,
+                "Project Id", Practice, "Utilization Location" AS Location, "Grade Name" AS Grade,
                 COUNT("Associate ID") AS headcount,
                 SUM(TRY_CAST("Billed FTE Internal" AS DOUBLE)) AS billed_fte,
-                SUM(TRY_CAST("Total FTE" AS DOUBLE)) AS total_fte,
                 ANY_VALUE("BU") AS bu_id,
                 ANY_VALUE("Customer Id") AS account_id,
                 ANY_VALUE("Project Name") AS project_name,
+                ANY_VALUE("Project Type") AS project_type,
                 ANY_VALUE("Project Billability") AS project_billability,
                 ANY_VALUE("Customer Name") AS customer_name,
                 ANY_VALUE("ParentCustomerID") AS parent_customer_id,
                 ANY_VALUE("Parent Customer") AS parent_customer,
-                ANY_VALUE("Is Onsite") AS is_onsite,
-                strftime(CURRENT_DATE, '%Y-%m-%d') AS prediction_date,
-                
+                ANY_VALUE("Is Onsite") AS is_onsite
             FROM utilization_prediction_report
+            GROUP BY 1, 2, 3, 4
+        ),
+        -- 2. Previous Month Aggregation (Now with Descriptive attributes)
+        previous_util AS (
+            SELECT 
+                "Project Id", Practice, "Utilization Location" AS Location, "Grade Name" AS Grade,
+                SUM(TRY_CAST("Billed FTE Internal" AS DOUBLE)) AS prev_mon_actual_billed_fte,
+                ANY_VALUE("BU") AS bu_id,
+                ANY_VALUE("Customer Id") AS account_id,
+                ANY_VALUE("Project Name") AS project_name,
+                ANY_VALUE("Project Type") AS project_type,
+                ANY_VALUE("Project Billability") AS project_billability,
+                ANY_VALUE("Customer Name") AS customer_name,
+                ANY_VALUE("ParentCustomerID") AS parent_customer_id,
+                ANY_VALUE("Parent Customer") AS parent_customer
+            FROM previous_month_actual
             GROUP BY 1, 2, 3, 4
         ),
         -- 2. Your Demand Summary (already correct)
         demand_summary AS (
-            SELECT "Project Id", Practice, Location, "Grade HR" AS Grade, COUNT(*) AS dem_count
+            SELECT "Project Id", Practice, Location, "Grade HR" AS Grade, COUNT(*) AS dem_count,
+            ANY_VALUE("BU") AS bu_id,
+            ANY_VALUE("Account Id") AS account_id,
+            ANY_VALUE("Project Description") AS project_name,
+            ANY_VALUE("Project Type") AS project_type,
+            ANY_VALUE("Project Billability") AS project_billability,
+            ANY_VALUE("Account Name") AS customer_name,
+            ANY_VALUE("Account ID") AS customer_id,
+            ANY_VALUE("Parent Customer ID") AS parent_customer_id,
+            ANY_VALUE("Parent Customer") AS parent_customer
             FROM demand_base
             GROUP BY 1, 2, 3, 4
         ),
-        -- 3. Your Release Summary (already correct)
+        fulfilment_summary AS (
+            SELECT "Project Id", Practice, Location, Grade, SUM(TRY_CAST(FTE AS DOUBLE)) AS fulfil_count
+            FROM fulfilment
+            GROUP BY 1, 2, 3, 4
+        ),
+
         release_summary AS (
-            SELECT "Project Id", Practice, Location, Grade, COUNT(*) AS rel_count
-            FROM np_jan26
+        SELECT "Project Id", Practice, Location, Grade, SUM(TRY_CAST(Impact_FTE AS DOUBLE)) AS rel_count
+            FROM releases
+            GROUP BY 1, 2, 3, 4
+        ),
+        attrition_summary AS (
+        SELECT "Project Id", Practice, Location, Grade, SUM(TRY_CAST("FTE Impact" AS DOUBLE)) AS attr_count
+            FROM attrition
             GROUP BY 1, 2, 3, 4
         ),
         -- New Cleaned Up Account Map
@@ -133,56 +170,68 @@ def create_master_report_view():
         FROM map_account
         GROUP BY "Account ID"
         ),
-        -- Previous month actual
-        previous_util AS (
-        SELECT "Project Id", Practice, "Utilization Location" AS Location, "Grade Name" AS Grade,
-        SUM(TRY_CAST("Billed FTE Internal" AS DOUBLE)) AS prev_mon_actual_billed_fte
-        FROM previous_month_actual
-        GROUP BY 1, 2, 3, 4
+
+        -- 3. Master Keys
+        master_keys AS (
+            SELECT "Project Id", Practice, Location, Grade FROM util_summarized
+            UNION 
+            SELECT "Project Id", Practice, Location, Grade FROM previous_util
+            UNION
+            SELECT "Project Id", practice, Location, Grade From demand_summary
         )
 
-        -- 4. Final Join (1-to-1-to-1 Join)
+        -- 4. Final Join
         SELECT  
-            u."Project Id", u.project_name, u.Practice, u.Location, u.Grade, g_map."CoD Grade", u.project_billability, 
-            u.customer_name, u.parent_customer_id, u.parent_customer, u.is_onsite, u.bu_id, 
-            u.account_id,u.billed_fte, u.prediction_date,
-            p.prev_mon_actual_billed_fte,
+            m."Project Id", 
+            COALESCE(u.project_name, p.project_name, d.project_name) AS project_name,
+            COALESCE(u.project_type, p.project_type, d.project_type) AS project_type,
+            COALESCE(u.project_billability, p.project_billability, d.project_billability) AS project_billability,
+            m.Practice, m.Location, m.Grade,
+            -- Pull from Current, fallback to Previous
+            
+            COALESCE(u.account_id, p.account_id, d.account_id) AS customer_id,
+            COALESCE(u.customer_name, p.customer_name, d.customer_name) AS customer_name,
+            COALESCE(u.parent_customer_id, p.parent_customer_id, d.parent_customer_id) AS parent_customer_id,
+            COALESCE(u.parent_customer, p.parent_customer, d.parent_customer) AS parent_customer_name,
+            COALESCE(u.bu_id, p.bu_id) AS BU,
+            
+            --ROUND(COALESCE(u.billed_fte, 0), 5) AS billed_fte, 
             COALESCE(r.rel_count, 0) AS release_count,
+            COALESCE(a.attr_count, 0) AS attr_count,
             COALESCE(d.dem_count, 0) AS open_demands, 
-            (u.billed_fte + open_demands - release_count ) AS eff_billed_fte, 
-            (CAST(c.Cost AS DOUBLE)) AS d_cost, 
-            (u.billed_fte * d_cost) AS curr_total_cost,
-            (eff_billed_fte * d_cost) AS pred_total_cost,
+            COALESCE(f.fulfil_count, 0) AS demands_fulfilled, 
+            
+            -- ALL computed columns
+            ROUND(COALESCE(p.prev_mon_actual_billed_fte, 0), 5) AS prev_mon_actual_billed_fte,
+            ROUND((COALESCE(p.prev_mon_actual_billed_fte, 0) + COALESCE({f_weight}*demands_fulfilled, 0) + COALESCE({d_weight}*open_demands, 0) - COALESCE(attr_count, 0) - COALESCE(release_count, 0) ), 5) AS eff_billed_fte,
+            ROUND(CAST(c.Cost AS DOUBLE), 5) AS d_cost,
+            ROUND((COALESCE(p.prev_mon_actual_billed_fte, 0) * d_cost), 5) AS prev_total_cost,
+            --ROUND((COALESCE(u.billed_fte, 0) * d_cost ), 5) AS curr_total_cost,
+            --ROUND(((COALESCE(u.billed_fte, 0) + COALESCE(d.dem_count, 0) - COALESCE(r.rel_count, 0)) * CAST(c.Cost AS DOUBLE)), 5) AS proj_total_cost,
+            ROUND((eff_billed_fte * d_cost), 5) AS proj_total_cost,
+            
             l_map.Country, l_map.Geo,
             b_map.SBU, b_map.Market,
-            a_map."PDL ID",a_map."PDL Name",
-            s_map."SBU Head ID", s_map."SBU Head Name"
+            a_map."PDL ID",
+            a_map."PDL Name",
+            s_map."SBU Head ID",
+            s_map."SBU Head Name",
+            strftime(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata', '%Y-%m-%d %H:%M:%S') as load_date
             
-        FROM util_summarized u
-        LEFT JOIN release_summary r 
-            ON  u."Project Id" = r."Project Id" 
-            AND u.Practice = r.Practice 
-            AND u.Location = r.Location 
-            AND u.Grade = r.Grade
-        LEFT JOIN demand_summary d 
-            ON  u."Project Id" = d."Project Id" 
-            AND u.Practice = d.Practice 
-            AND u.Location = d.Location 
-            AND u.Grade = d.Grade
-        LEFT JOIN previous_util p
-        ON u."Project Id" = p."Project Id"
-        AND u.Practice = p.Practice 
-        AND u.Location = p.Location 
-        AND u.Grade = p.Grade
-        LEFT JOIN map_location l_map ON u.Location = l_map."Utilization Location"
-        LEFT JOIN cost_dec_25 c
-                ON u.Practice = c.Practice
-                AND l_map.Country = c.Country
-                AND u.Grade = c."Grade name"
-        LEFT JOIN map_bu b_map       ON u.bu_id = b_map.BU
-        LEFT JOIN map_sbu s_map      ON b_map.SBU = s_map.SBU
-        LEFT JOIN map_grade g_map    ON u.Grade = g_map.Grade
-        LEFT JOIN map_account_unique a_map  ON u.account_id = a_map."Account ID";
+        FROM master_keys m
+        LEFT JOIN util_summarized u ON m."Project Id" = u."Project Id" AND m.Practice = u.Practice AND m.Location = u.Location AND m.Grade = u.Grade
+        LEFT JOIN previous_util p ON m."Project Id" = p."Project Id" AND m.Practice = p.Practice AND m.Location = p.Location AND m.Grade = p.Grade
+        -- IMPORTANT: Join map tables to m (master) or COALESCE values to ensure they work for closed projects
+        LEFT JOIN map_location l_map ON m.Location = l_map."Utilization Location"
+        LEFT JOIN cost_file c ON m.Practice = c.Practice AND l_map.Country = c.Country AND m.Grade = c."Grade name"
+        LEFT JOIN map_bu b_map ON COALESCE(u.bu_id, p.bu_id) = b_map.BU
+        LEFT JOIN map_sbu s_map ON b_map.SBU = s_map.SBU
+        LEFT JOIN map_account_unique a_map ON COALESCE(u.account_id, p.account_id) = a_map."Account ID"
+        -- Demand and Release still join to m/u/p logic
+        LEFT JOIN demand_summary d ON m."Project Id" = d."Project Id" AND m.Practice = d.Practice AND m.Location = d.Location AND m.Grade = d.Grade
+        LEFT JOIN fulfilment_summary f ON m."Project Id" = f."Project Id" AND m.Practice = f.Practice AND m.Location = f.Location AND m.Grade = f.Grade
+        LEFT JOIN attrition_summary a ON m."Project Id" = a."Project Id" AND m.Practice = a.Practice AND m.Location = a.Location AND m.Grade = a.Grade
+        LEFT JOIN release_summary r ON m."Project Id" = r."Project Id" AND m.Practice = r.Practice AND m.Location = r.Location AND m.Grade = r.Grade;
     """
 
     try:
@@ -194,7 +243,32 @@ def create_master_report_view():
 
     except Exception as e:
         st.error(f"Failed to generate report: {e}")
-
+def create_pdl_summary_view():
+    """
+    Aggregates the Dashboard into PDL-level summary.
+    """
+    sql ="""
+        CREATE OR REPLACE VIEW pdl_summary AS
+            SELECT 
+                --SBU,
+                --"SBU Head Name",
+                "PDL Name",
+                parent_customer_name,
+                ANY_VALUE(Practice) as practice, 
+                ANY_VALUE(project_type) as project_type, 
+                ANY_VALUE(grade) as grade,
+                -- Totals
+                ROUND(SUM(prev_mon_actual_billed_fte)) AS last_bfte,
+                ROUND(SUM(prev_total_cost)/NULLIF(last_bfte,0)) AS prev_cost_per_bfte,
+                ROUND(SUM(proj_total_cost)/NULLIF(last_bfte,0)) AS projected_cost_per_bfte,
+                (projected_cost_per_bfte - prev_cost_per_bfte) AS diff,
+                strftime(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata', '%Y-%m-%d %H:%M:%S') as load_date
+            FROM dashboard
+            GROUP BY 1, 2
+            ORDER BY "PDL Name", parent_customer_name;
+    """
+    with get_db_con() as con:
+        con.execute(sql)
 def render_table_group(table_list, key_prefix):
     selected = []
     if not table_list:
@@ -244,14 +318,23 @@ def confirm_delete_dialog(table_name):
 
 @st.dialog("Table Preview", width="large")
 def preview_table_dialog(table_name):
-    st.write(f"Showing the first 50 rows of **{table_name}**")
+    st.write(f"Showing rows from **{table_name}**")
 
     try:
         with get_db_con_ro() as con:
-            df_preview = con.execute(f'SELECT * FROM "{table_name}" LIMIT 50').df()
+            df_preview = con.execute(f'SELECT * FROM "{table_name}"').df()
         
+        search_query = st.text_input("🔍 Search table (e.g., PDL, Customer, or Project)", placeholder="Type to filter...")
+        if search_query:
+            mask = df_preview.apply(lambda row: row.astype(str).str.contains(search_query, case=False).any(), axis=1)
+            df_display = df_preview[mask]
+        else:
+            df_display = df_preview
+
+        st.write(f"Showing {len(df_display)} of {len(df_preview)} records")
+
         if not df_preview.empty:
-            st.dataframe(df_preview, use_container_width=True, hide_index=True)
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
         else:
             st.info("This table is currently empty.")
     except Exception as e:
@@ -278,9 +361,9 @@ with st.sidebar:
     all_tables = get_all_tables()
 
     # Categorize tables based on namming conventions
-    transactions = [t for t in all_tables if not t.startswith(('map_', '_ref', 'v_','dashboard'))]
+    transactions = [t for t in all_tables if not t.startswith(('map_', '_ref', 'v_','dashboard','archive'))]
     lookups = [t  for t in all_tables if t.startswith('map_')]
-    views = [t for t in all_tables if t.startswith('v_') or t == "dashboard"]
+    views = [t for t in all_tables if t.startswith(('pdl', 'dashboard'))]
 
     # 2a. Transactional Data
     with st.expander("📊 Transactional Tables", expanded=False):
@@ -297,12 +380,32 @@ with st.sidebar:
     # Final combined list for AI context
     selected_tables = selected_transactions + selected_lookups + selected_views
 
-    st.divider()
+    #st.divider()
+
+    #st.subheader("⚙️ Calculation Settings")
+    with st.expander("⚙️ Adjust Weights", expanded=False):
+        st.session_state.fulfilment_weight = st.slider(
+            "Fulfillment %", 0.0, 1.0, 0.2, 0.1,
+            help="Weightage for fulfilled demands in Effective FTE"
+        )
+        st.session_state.demand_weight = st.slider(
+            "Open Demand %", 0.0, 1.0, 0.5, 0.1,
+             help="Weightage for open demands in effective FTE"
+        )
 
     # --- ZONE 3: ACTIONS ---
-    if st.button("🪄 Build Master Report", type="primary", use_container_width=True):
-        create_master_report_view()
-
+    col1 , col2 = st.columns(2)
+    with col1:
+        if st.button("🪄 Dashboard", type="primary", use_container_width=True):
+            create_master_report_view(
+                f_weight=st.session_state.fulfilment_weight,
+                d_weight=st.session_state.demand_weight
+            )
+            st.success("Dashboard Updated!")
+    with col2:
+        if st.button("📈 PDL View", type="primary", use_container_width=True):
+            create_pdl_summary_view()
+            st.success("PDL Summary Updated!")
     st.divider()
     with st.expander("🛠️ SQL Console"):
         query = st.text_area("Paste your Query here:", height=150)
@@ -319,107 +422,6 @@ if "preview_table" in st.session_state and st.session_state.preview_table:
     st.session_state.preview_table = None
     preview_table_dialog(table_to_show)
     
-
-# Sidebar for setup
-# with st.sidebar:
-#     st.title("📂 Data Warehouse")
-#     data_ingestion_ui()
-
-#     view_name = "dashboard"
- 
-#     sql_view="""
-#             SELECT 
-#             t1."Project Id", 
-#             t1.Practice, 
-#             t1."Utilization Location" as Location, 
-#             t1."Grade Name" as Grade, 
-#             t1."Billed FTE Internal", 
-#             t1."Total FTE",
-#             COALESCE(demands.demand_count, 0) AS Demand,
-#             attr.attrition
-#         FROM utilization_prediction_report t1 
-#         LEFT JOIN (
-#             SELECT 
-#                 "Project Id", 
-#                 Practice, 
-#                 Location, 
-#                 "Grade HR", 
-#                 COUNT(*) AS demand_count
-#             FROM demand_base
-#             GROUP BY "Project Id", Practice, Location, "Grade HR"
-#         ) demands 
-#         ON  t1."Project Id" = demands."Project Id" 
-#         AND t1.Practice = demands.Practice 
-#         AND t1."Utilization Location" = demands.Location 
-#         AND t1."Grade Name" = demands."Grade HR" 
-#         LEFT JOIN (
-#             SELECT 
-#                 "Project Id", Practice, Location, Grade, 
-#                 MAX("Count of ID") as attrition
-#             FROM np_jan26
-#             GROUP BY 1, 2, 3, 4
-#         ) attr 
-#             ON  t1."Project Id" = attr."Project Id" 
-#             AND t1.Practice = attr.Practice 
-#             AND t1."Utilization Location" = attr.Location 
-#             AND t1."Grade Name" = attr.Grade;
-#         """
-#     if st.button("Generate Report", type="primary", use_container_width=True):
-#         try:
-#             with get_db_con() as con:
-#                 con.execute(f"CREATE OR REPLACE VIEW {view_name} AS {sql_view}")
-#             st.success(f"View '{view_name}' created!")
-#             st.rerun()
-#         except Exception as e:
-#             st.error(f"SQL Error: {e}")
-        
-
-#     # Checkbox selection
-#     st.write("---")
-#     st.subheader("Select Tables")
-#     all_tables = get_all_tables()
-#     selected_tables = []
-
-#     if all_tables:
-#         for table in all_tables:
-#             col1, col2 = st.columns([0.8, 0.2])
-
-#             if col1.checkbox(f"{table}", value=False, key=f"chk_{table}"):
-#                 selected_tables.append(table)
-
-#             # Delete button on the right
-#             # if col2.button("🗑️", key=f"del_{table}", help=f"Delete {table} permanently", use_container_width=True):
-#             #     st.session_state.confirm_delete = table
-#             #     st.rerun()
-#             if col2.button("❌", key=f"del_{table}", type="secondary"):
-#                 st.session_state.confirm_delete = table
-#                 st.rerun()
-#         if "confirm_delete" in st.session_state:
-#             target = st.session_state.confirm_delete
-#             st.error(f"Are you sure you want to delete **{target}**?")
-#             c1, c2 = st.columns(2)
-#             if c1.button("Yes, Delete", type="primary", width='stretch'):
-#                 with get_db_con() as con:
-#                     con.execute(f'DROP TABLE "{target}"')
-#                 del st.session_state.confirm_delete
-#                 st.toast(f"Table {target} removed.")
-#                 st.rerun()
-#             if c2.button("cancel", width='stretch'):
-#                 del st.session_state.confirm_delete
-#                 st.rerun
-#     else:
-#         st.info("No files exist. Upload a file to begin.")
-    
-#     # Data Preview
-#     if selected_tables:
-#         with st.expander("Table Previews", expanded=False):
-#             with get_db_con() as con:
-#                 for table in selected_tables:
-#                     st.write(f"**{table}** (Top 5 rows)")
-#                     preview_df = con.execute(f"SELECT * FROM {table} LIMIT 1000").df()
-#                     st.dataframe(preview_df, width='stretch')
-#     if not selected_tables and all_tables:
-#         st.warning("Select tables to provide context to AI")
 
 # Chat interface
 if "messages" not in st.session_state:

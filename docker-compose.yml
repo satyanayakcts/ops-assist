@@ -1,0 +1,13 @@
+services:
+  streamlit-agent:
+    build: .
+    image: ops-assist:v1
+    container_name: ops_assist_app
+    ports:
+      - "8556:8556"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - DATABASE_PATH=${DATABASE_PATH}
+    restart: always
